@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+
+import socket, ssl, re, time, argparse
+from urllib.parse import urljoin, urlparse
+from html.parser import HTMLParser
+from collections import deque
+
+# Constants
+FAKEBOOK_DOMAIN = "fakebook.khoury.northeastern.edu"
+LOGIN_PATH = "/accounts/login/?next=/fakebook/"
+ROOT_PATH = "/fakebook/"
+MAX_FLAGS = 5
+PORT = 443
+
+# This is an HTML parser to extract links, CSRF token, and secret flags
+class FlagParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.csrf_token = None
+        self.flags = []
+        self.in_flag = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == "a" and "href" in attrs_dict:
+            self.links.append(attrs_dict["href"])
+        if tag == "input" and attrs_dict.get("name") == "csrfmiddlewaretoken":
+            self.csrf_token = attrs_dict["value"]
+        if tag == "h3" and attrs_dict.get("class") == "secret_flag":
+            self.in_flag = True
+
+    def handle_data(self, data):
+        if self.in_flag:
+            match = re.search(r"FLAG: (\w{64})", data)
+            if match:
+                self.flags.append(match.group(1))
+        self.in_flag = False
+
+# This function establishes a secure TLS connection to the given host and port
+def create_ssl_connection(host, port):
+    sock = socket.create_connection((host, port))
+    context = ssl.create_default_context()
+    return context.wrap_socket(sock, server_hostname=host)
+
+# This function sends a full request and reads the full HTTP response
+def send_request(sock, request):
+    sock.sendall(request.encode())
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    return response
+
+# This function parses HTTP response into status code, headers, and body
+def parse_response(response_bytes):
+    response = response_bytes.decode(errors="ignore")
+    header_end = response.find("\r\n\r\n")
+    headers_raw = response[:header_end].split("\r\n")
+    body = response[header_end + 4:]
+    status_line = headers_raw[0]
+    status_code = int(status_line.split()[1])
+
+    headers = {}
+    for h in headers_raw[1:]:
+        if ": " in h:
+            key, val = h.split(": ", 1)
+            key = key.lower()
+            if key in headers:
+                if isinstance(headers[key], list):
+                    headers[key].append(val)
+                else:
+                    headers[key] = [headers[key], val]
+            else:
+                headers[key] = val
+    return status_code, headers, body
+
+# This function extracts cookies from the response headers
+def get_cookie(headers):
+    cookies = {}
+    set_cookie = headers.get("set-cookie")
+
+    raw_cookies = []
+    if isinstance(set_cookie, list):
+        raw_cookies = set_cookie
+    elif isinstance(set_cookie, str):
+        raw_cookies = [set_cookie]
+
+    for cookie in raw_cookies:
+        parts = cookie.split(";", 1)[0]
+        if "=" in parts:
+            name, value = parts.split("=", 1)
+            cookies[name.strip()] = value.strip()
+
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+# This function sends a manual HTTP GET request
+def http_get(path, host, cookies=None):
+    sock = create_ssl_connection(host, PORT)
+    headers = f"Host: {host}\r\nConnection: close\r\n"
+    if cookies:
+        headers += f"Cookie: {cookies}\r\n"
+    request = f"GET {path} HTTP/1.1\r\n{headers}\r\n"
+    response = send_request(sock, request)
+    sock.close()
+    return parse_response(response)
+
+# This function sends a manual HTTP POST request with form data
+def http_post(path, host, data, cookies=None):
+    sock = create_ssl_connection(host, PORT)
+    body = "&".join([f"{k}={v}" for k, v in data.items()])
+    headers = (
+        f"Host: {host}\r\n"
+        f"Content-Type: application/x-www-form-urlencoded\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
+    )
+    if cookies:
+        headers += f"Cookie: {cookies}\r\n"
+    request = f"POST {path} HTTP/1.1\r\n{headers}\r\n{body}"
+    response = send_request(sock, request)
+    sock.close()
+    return parse_response(response)
+
+# This function combines cookies from two sources without duplicating names
+def merge_cookies(c1, c2):
+    merged = {}
+    for cookie in (c1 or "").split("; "):
+        if "=" in cookie:
+            k, v = cookie.split("=", 1)
+            merged[k] = v
+    for cookie in (c2 or "").split("; "):
+        if "=" in cookie:
+            k, v = cookie.split("=", 1)
+            merged[k] = v
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
+
+# This function acts as the main crawl logic
+def crawl(username, password, host=FAKEBOOK_DOMAIN):
+    visited = set()
+    queue = deque()
+    found_flags = set()
+
+    # Get login page to retrieve CSRF token
+    code, headers, body = http_get(LOGIN_PATH, host)
+    parser = FlagParser()
+    parser.feed(body)
+    csrf = parser.csrf_token
+    cookies = get_cookie(headers)
+
+    # Post login form with credentials and CSRF token
+    data = {
+        "username": username,
+        "password": password,
+        "csrfmiddlewaretoken": csrf
+    }
+    code, headers, body = http_post(LOGIN_PATH, host, data, cookies)
+    cookies = merge_cookies(cookies, get_cookie(headers))
+
+    # Start breadth-first crawl
+    queue.append(ROOT_PATH)
+    while queue and len(found_flags) < MAX_FLAGS:
+        current_path = queue.popleft()
+        if current_path in visited:
+            continue
+        visited.add(current_path)
+
+        # Avoid logging out
+        if current_path.startswith("/accounts/logout"):
+            continue
+
+        # Retry logic for temporary 503 errors
+        retry = 0
+        while retry < 3:
+            code, headers, body = http_get(current_path, host, cookies)
+            if code == 503:
+                time.sleep(1)
+                retry += 1
+                continue
+            break
+
+        # Handle various HTTP responses
+        if code in {403, 404}:
+            continue
+        elif code == 302:
+            location = headers.get("location", "")
+            if location and location.startswith("/"):
+                queue.append(location)
+            continue
+        elif code != 200:
+            continue
+
+        # Parse the body for flags and links
+        parser = FlagParser()
+        parser.feed(body)
+        for flag in parser.flags:
+            if len(found_flags) < MAX_FLAGS:
+                print(flag)
+                found_flags.add(flag)
+
+        # Queue internal links for crawling
+        for link in parser.links:
+            full_url = urljoin(f"https://{host}{current_path}", link)
+            parsed = urlparse(full_url)
+            if parsed.hostname == host and parsed.path not in visited:
+                queue.append(parsed.path)
+
+# Entry point for CLI
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("username")
+    parser.add_argument("password")
+    parser.add_argument("-s", "--server", default=FAKEBOOK_DOMAIN)
+    parser.add_argument("-p", "--port", type=int, default=443)
+    args = parser.parse_args()
+
+    # Debug
+    # print("Crawler starting...")
+
+    crawl(args.username, args.password, host=args.server)
